@@ -28,6 +28,7 @@
 #include "nrf_soc.h"
 #include "delay.h"
 #include "rtos.h"
+#include "assert.h"
 
 
 #ifdef NRF52840_XXAA
@@ -44,11 +45,18 @@ extern uint32_t __flash_arduino_start[];
 // MACRO TYPEDEF CONSTANT ENUM DECLARATION
 //--------------------------------------------------------------------+
 static SemaphoreHandle_t _sem = NULL;
+static bool _flash_op_failed = false;
 
 void flash_nrf5x_event_cb (uint32_t event)
 {
-//  if (event != NRF_EVT_FLASH_OPERATION_SUCCESS) LOG_LV1("IFLASH", "Flash op Failed");
-  if ( _sem ) xSemaphoreGive(_sem);
+  if ( _sem ) {
+    // Record the result, for consumption by fal_erase or fal_program
+    // Used to reattempt failed operations
+    _flash_op_failed = (event == NRF_EVT_FLASH_OPERATION_ERROR);
+
+    // Signal to fal_erase or fal_program that our async flash op is now complete
+    xSemaphoreGive(_sem);
+  } 
 }
 
 // Flash Abstraction Layer
@@ -107,30 +115,46 @@ static bool fal_erase (uint32_t addr)
   // Init semaphore for first call
   if ( _sem == NULL )
   {
-    _sem = xSemaphoreCreateCounting(10, 0);
+    _sem = xSemaphoreCreateBinary();
     VERIFY(_sem);
   }
 
-  // retry if busy
-  uint32_t err;
-  while ( NRF_ERROR_BUSY == (err = sd_flash_page_erase(addr / FLASH_NRF52_PAGE_SIZE)) )
-  {
-    delay(1);
-  }
-  VERIFY_STATUS(err, false);
-
-  // wait for async event if SD is enabled
+  // Check if soft device is enabled
+  // If yes, flash operations are async, so we need to wait for the callback to give the semaphore
   uint8_t sd_en = 0;
   (void) sd_softdevice_is_enabled(&sd_en);
 
-  if ( sd_en ) xSemaphoreTake(_sem, portMAX_DELAY);
+  // Make multiple attempts
+  for (uint8_t attempt = 0;;) {
+    // Attempt to erase
+    uint32_t err = sd_flash_page_erase(addr / FLASH_NRF52_PAGE_SIZE);
+    // Retry if busy
+    if (err == NRF_ERROR_BUSY) {
+      delay(1);
+      continue;
+    }
+    // Count genuine attempts
+    attempt++;
+    // If using softdevice, erase is async, so we wait here
+    if (sd_en) xSemaphoreTake(_sem, portMAX_DELAY);
+    // If erase failed
+    if (_flash_op_failed) {
+      assert(attempt < 10); // Something went horribly wrong.. protect the flash
+      continue; // Try again
+    }
+    // Catch any other odd results
+    VERIFY_STATUS(err, 0);
+    // Success
+    break;
+  }
 
   return true;
 }
 
 static uint32_t fal_program (uint32_t dst, void const * src, uint32_t len)
 {
-  // wait for async event if SD is enabled
+  // Check if soft device is enabled
+  // If yes, flash operations are async, so we need to wait for the callback to give the semaphore
   uint8_t sd_en = 0;
   (void) sd_softdevice_is_enabled(&sd_en);
 
@@ -148,19 +172,56 @@ static uint32_t fal_program (uint32_t dst, void const * src, uint32_t len)
 
   if ( sd_en ) xSemaphoreTake(_sem, portMAX_DELAY);
 #else
-  while ( NRF_ERROR_BUSY == (err = sd_flash_write((uint32_t*) dst, (uint32_t const *) src, len/8)) )
-  {
-    delay(1);
-  }
-  VERIFY_STATUS(err, 0);
-  if ( sd_en ) xSemaphoreTake(_sem, portMAX_DELAY);
 
-  while ( NRF_ERROR_BUSY == (err = sd_flash_write((uint32_t*) (dst+ len/2), (uint32_t const *) (src + len/2), len/8)) )
-  {
-    delay(1);
+  // First part of block
+  // ------------------
+  for (uint8_t attempt = 0;;) {
+    // Attempt to write
+    uint32_t err = sd_flash_write((uint32_t*) dst, (uint32_t const *) src, len/8);
+    // Retry if busy
+    if (err == NRF_ERROR_BUSY) {
+      delay(1);
+      continue;
+    }
+    // Count genuine attempts
+    attempt++;
+    // If using softdevice, write is async, so we wait here
+    if (sd_en) xSemaphoreTake(_sem, portMAX_DELAY);
+    // If write failed
+    if (_flash_op_failed) {
+      assert(attempt < 10); // Something went horribly wrong.. protect the flash
+      continue; // Try again
+    }
+    // Catch any other odd results
+    VERIFY_STATUS(err, 0);
+    // Success
+    break;
   }
-  VERIFY_STATUS(err, 0);
-  if ( sd_en ) xSemaphoreTake(_sem, portMAX_DELAY);
+
+  // Second part of block
+  // --------------------
+  for (uint8_t attempt = 0;;) {
+    // Attempt to write
+    uint32_t err = sd_flash_write((uint32_t*) (dst+ len/2), (uint32_t const *) (src + len/2), len/8);
+    // Retry if busy
+    if (err == NRF_ERROR_BUSY) {
+      delay(1);
+      continue;
+    }
+    // Count genuine attempts
+    attempt++;
+    // If using softdevice, write is async, so we wait here
+    if (sd_en) xSemaphoreTake(_sem, portMAX_DELAY);
+    // If write failed
+    if (_flash_op_failed) {
+      assert(attempt < 10); // Something went horribly wrong.. protect the flash
+      continue; // Try again
+    }
+    // Catch any other odd results
+    VERIFY_STATUS(err, 0);
+    // Success
+    break;
+  }
 #endif
 
   return len;
