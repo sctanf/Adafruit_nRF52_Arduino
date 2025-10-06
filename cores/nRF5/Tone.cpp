@@ -44,8 +44,10 @@ Version Modified By Date     Comments
 // NOTE: Currently hard-coded to only use PWM2 ...
 //       These are the relvant hard-coded variables
 // TODO: Consider allowing dynamic use of any available PWM peripheral (but start with #2 for compatibility)
-static NRF_PWM_Type * const _PWMInstance = NRF_PWM2;
-static HardwarePWM  * const _HwPWM       = HwPWMx[2];
+static NRF_PWM_Type * const _PWMInstance0 = NRF_PWM0;
+static NRF_PWM_Type * const _PWMInstance1 = NRF_PWM1;
+static NRF_PWM_Type * const _PWMInstance2 = NRF_PWM2;
+static HardwarePWM  ** const _HwPWM       = HwPWMx;
 
 // Defined a struct, to simplify validation testing ... also provides context when debugging
 class TonePwmConfig {
@@ -56,16 +58,16 @@ class TonePwmConfig {
         uint32_t seq1_refresh;        //< count of pulses for each SEQ1 iteration
         uint16_t loop_count;          //< how many times to restart SEQ0/SEQ1?
         uint16_t time_period;         //< how many clock cycles allocated to each PWM pulse?
-        uint16_t duty_with_polarity;  //< SEQ[N].PTR will point here, length == 1
+        uint16_t duty_with_polarity[4];  //< SEQ[N].PTR will point here, length == 1
         nrf_pwm_task_t task_to_start; //< Whether to start playback at SEQ0 or SEQ1
         nrf_pwm_short_mask_t shorts;  //< shortcuts to enable
 
     public:
-        bool ensurePwmPeripheralOwnership(void);
+        bool ensurePwmPeripheralOwnership(int pwm_instance);
         bool initializeFromPulseCountAndTimePeriod(uint64_t pulse_count, uint16_t time_period);
-        bool applyConfiguration(uint32_t pin);
-        bool startPlayback(void);
-        bool stopPlayback(bool releaseOwnership = false);
+        bool applyConfiguration(uint32_t pin, int pwm_instance);
+        bool startPlayback(int pwm_instance);
+        bool stopPlayback(bool releaseOwnership, int pwm_instance);
 };
 TonePwmConfig _pwm_config;
 
@@ -170,6 +172,13 @@ static int _bits_used(unsigned long long x) {
 */
 void tone(uint8_t pin, unsigned int frequency, unsigned long duration)
 {
+    int pwm_instance = 2;
+    if (pin == 15) {
+        pwm_instance = 2;
+    }
+    if (pin == 8) {
+        pwm_instance = 1;
+    }
     // limit frequency to reasonable audible range	
     if((frequency < 20) | (frequency > 25000)) {
         LOG_LV1("Tone", "frequency outside range [20..25000] -- ignoring");
@@ -177,15 +186,15 @@ void tone(uint8_t pin, unsigned int frequency, unsigned long duration)
     }
     uint64_t pulse_count = _calculate_pulse_count(frequency, duration);
     uint16_t time_period = _calculate_time_period(frequency);
-    if (!_pwm_config.ensurePwmPeripheralOwnership()) {
+    if (!_pwm_config.ensurePwmPeripheralOwnership(pwm_instance)) {
         LOG_LV1("Tone", "Unable to acquire PWM peripheral");
-    } else if (!_pwm_config.stopPlayback(false)) {
+    } else if (!_pwm_config.stopPlayback(false, pwm_instance)) {
         LOG_LV1("Tone", "Unable to stop playback");
     } else if (!_pwm_config.initializeFromPulseCountAndTimePeriod(pulse_count, time_period)) {
         LOG_LV1("Tone", "Failed calculating configuration");
-    } else if (!_pwm_config.applyConfiguration(pin)) {
+    } else if (!_pwm_config.applyConfiguration(pin, pwm_instance)) {
         LOG_LV1("Tone", "Failed applying configuration");
-    } else if (!_pwm_config.startPlayback()) {
+    } else if (!_pwm_config.startPlayback(pwm_instance)) {
         LOG_LV1("Tone", "Failed attempting to start PWM peripheral");
     } else {
         //LOG_LV2("Tone", "Started playback of tone at frequency %d duration %ld", frequency, duration);
@@ -195,12 +204,19 @@ void tone(uint8_t pin, unsigned int frequency, unsigned long duration)
 
 void noTone(uint8_t pin)
 {
+    int pwm_instance = 2;
+    if (pin == 15) {
+        pwm_instance = 2;
+    }
+    if (pin == 8) {
+        pwm_instance = 1;
+    }
     ( void )pin; // avoid unreferenced parameter compiler warning
-    _pwm_config.stopPlayback(true); // release ownership of PWM peripheral
+    _pwm_config.stopPlayback(true, pwm_instance); // release ownership of PWM peripheral
 }
 
-bool TonePwmConfig::ensurePwmPeripheralOwnership(void) {
-    if (!_HwPWM->isOwner(TonePwmConfig::TONE_TOKEN) && !_HwPWM->takeOwnership(TonePwmConfig::TONE_TOKEN)) {
+bool TonePwmConfig::ensurePwmPeripheralOwnership(int pwm_instance) {
+    if (!_HwPWM[pwm_instance]->isOwner(TonePwmConfig::TONE_TOKEN) && !_HwPWM[pwm_instance]->takeOwnership(TonePwmConfig::TONE_TOKEN)) {
         LOG_LV1("Tone", "unable to allocate PWM2 to Tone");
         return false;
     }
@@ -246,7 +262,11 @@ bool TonePwmConfig::initializeFromPulseCountAndTimePeriod(uint64_t pulse_count_x
 
     this->pulse_count = pulse_count_x;
     this->time_period = time_period;
-    this->duty_with_polarity = 0x8000U | (time_period / 2U);
+    // a, b, c, d
+    this->duty_with_polarity[0] = 0x8000U | (time_period / 2U);
+    this->duty_with_polarity[1] = (time_period / 2U); // inverted polarity
+    this->duty_with_polarity[2] = 0x8000U | (time_period / 2U);
+    this->duty_with_polarity[3] = (time_period / 2U); // inverted polarity
 
     if (this->pulse_count == 0) {
         this->seq0_refresh  = 0xFFFFFFU; // 24-bit maximum value
@@ -311,33 +331,55 @@ bool TonePwmConfig::initializeFromPulseCountAndTimePeriod(uint64_t pulse_count_x
     return true;
 }
 
-bool TonePwmConfig::applyConfiguration(uint32_t pin) {
+bool TonePwmConfig::applyConfiguration(uint32_t pin, int pwm_instance) {
+    NRF_PWM_Type * _PWMInstance = _PWMInstance2;
+    if (pwm_instance == 0) {
+        _PWMInstance = _PWMInstance0;
+    }
+    if (pwm_instance == 1) {
+        _PWMInstance = _PWMInstance1;
+    }
+
     if (pin >= PINS_COUNT) {
         return false;
     }
-    if (!this->ensurePwmPeripheralOwnership()) {
+    if (!this->ensurePwmPeripheralOwnership(pwm_instance)) {
         return false;
     }
-    this->stopPlayback(false);
+    this->stopPlayback(false, pwm_instance);
+
+    uint32_t pin_b = NRF_PWM_PIN_NOT_CONNECTED;
+    uint32_t pin_c = NRF_PWM_PIN_NOT_CONNECTED;
+    uint32_t pin_d = NRF_PWM_PIN_NOT_CONNECTED;
+    if (pin == 15) {
+        pin_b = g_ADigitalPinMap[26];
+        pin_c = g_ADigitalPinMap[7];
+        pin_d = g_ADigitalPinMap[5];
+    }
+    if (pin == 8) {
+        pin_b = g_ADigitalPinMap[6];
+        pin_c = g_ADigitalPinMap[12];
+        pin_d = g_ADigitalPinMap[4];
+    }
 
     uint32_t pins[NRF_PWM_CHANNEL_COUNT] = {
         g_ADigitalPinMap[pin],
-        NRF_PWM_PIN_NOT_CONNECTED,
-        NRF_PWM_PIN_NOT_CONNECTED,
-        NRF_PWM_PIN_NOT_CONNECTED
+        pin_b,
+        pin_c,
+        pin_d
     };
 
     nrf_pwm_pins_set(_PWMInstance, pins); // must set pins before enabling
     nrf_pwm_enable(_PWMInstance);
     nrf_pwm_configure(_PWMInstance, NRF_PWM_CLK_125kHz, NRF_PWM_MODE_UP, this->time_period);
-    nrf_pwm_decoder_set(_PWMInstance, NRF_PWM_LOAD_COMMON, NRF_PWM_STEP_AUTO);
+    nrf_pwm_decoder_set(_PWMInstance, NRF_PWM_LOAD_INDIVIDUAL, NRF_PWM_STEP_AUTO);
     nrf_pwm_shorts_set(_PWMInstance, this->shorts);
     nrf_pwm_int_set(_PWMInstance, 0);
 
-    nrf_pwm_seq_ptr_set(_PWMInstance, 0, &this->duty_with_polarity);
-    nrf_pwm_seq_ptr_set(_PWMInstance, 1, &this->duty_with_polarity);
-    nrf_pwm_seq_cnt_set(_PWMInstance, 0, 1);
-    nrf_pwm_seq_cnt_set(_PWMInstance, 1, 1);
+    nrf_pwm_seq_ptr_set(_PWMInstance, 0, &this->duty_with_polarity[0]);
+    nrf_pwm_seq_ptr_set(_PWMInstance, 1, &this->duty_with_polarity[0]);
+    nrf_pwm_seq_cnt_set(_PWMInstance, 0, 4);
+    nrf_pwm_seq_cnt_set(_PWMInstance, 1, 4);
 
     nrf_pwm_seq_refresh_set(_PWMInstance, 0, seq0_refresh);
     nrf_pwm_seq_refresh_set(_PWMInstance, 1, seq1_refresh);
@@ -355,8 +397,16 @@ bool TonePwmConfig::applyConfiguration(uint32_t pin) {
     return true;
 }
 
-bool TonePwmConfig::startPlayback(void) {
-    if (!this->ensurePwmPeripheralOwnership()) {
+bool TonePwmConfig::startPlayback(int pwm_instance) {
+    NRF_PWM_Type * _PWMInstance = _PWMInstance2;
+    if (pwm_instance == 0) {
+        _PWMInstance = _PWMInstance0;
+    }
+    if (pwm_instance == 1) {
+        _PWMInstance = _PWMInstance1;
+    }
+
+    if (!this->ensurePwmPeripheralOwnership(pwm_instance)) {
         LOG_LV1("Tone", "PWM peripheral not available for playback");
         return false;
     }
@@ -364,9 +414,16 @@ bool TonePwmConfig::startPlayback(void) {
     return true;
 }
 
-bool TonePwmConfig::stopPlayback(bool releaseOwnership) {
+bool TonePwmConfig::stopPlayback(bool releaseOwnership, int pwm_instance) {
+    NRF_PWM_Type * _PWMInstance = _PWMInstance2;
+    if (pwm_instance == 0) {
+        _PWMInstance = _PWMInstance0;
+    }
+    if (pwm_instance == 1) {
+        _PWMInstance = _PWMInstance1;
+    }
 
-    if (!_HwPWM->isOwner(TonePwmConfig::TONE_TOKEN)) {
+    if (!_HwPWM[pwm_instance]->isOwner(TonePwmConfig::TONE_TOKEN)) {
       LOG_LV2("Tone", "Attempt to set noTone when not the owner of the PWM peripheral.  Ignoring call....");
       return false;
     }
@@ -378,7 +435,7 @@ bool TonePwmConfig::stopPlayback(bool releaseOwnership) {
     }
 
     if (releaseOwnership) {
-        _HwPWM->releaseOwnership(TonePwmConfig::TONE_TOKEN);
+        _HwPWM[pwm_instance]->releaseOwnership(TonePwmConfig::TONE_TOKEN);
     }
 
     return true;
